@@ -31,8 +31,8 @@ namespace LAYOUT
             // Usually how this goes is that we draw everything in this paintEvent
             // which gets periodically called, and can be called by us. The problem
             // is that this thing does not do incremental changes, meaning it will
-            // traverse the whole tree everytime we draw!! That's why we use the
-            // QPainterPath above.
+            // traverse the whole tree everytime we draw!! I don't want to be
+            // that stupid, and that's why we use the QPainterPath above.
             void paintEvent(QPaintEvent *event);
 
         public:

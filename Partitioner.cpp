@@ -12,9 +12,10 @@ namespace PARTITIONER
     pthread_mutex_t BestMutex;
     pthread_mutex_t IOMutex;
     std::vector<Partitions> ThreadStartPoints;
+    std::vector<Locations> ThreadLocations;
     Partitions BestSolution;
     uint32_t BestSolutionCost = UINT32_MAX;
-    uint32_t MaxPartitionSide;
+    uint32_t MaxPartitionSize;
     std::vector<Coordinates> GUIThreadStartPoints;
 
     void setNumberOfThreads(uint32_t Num, bool Verbose)
@@ -45,8 +46,14 @@ namespace PARTITIONER
         if (Verbose)
             std::cout << "\tEPartitioner: Initializing " << NumThreads << " worker threads\n";
 
+        // Initializing stuff.
         WorkerThreads.resize(NumThreads);
         ThreadStartPoints.resize(NumThreads);
+        ThreadLocations.resize(NumThreads);
+        for (uint32_t i = 0; i < NumThreads; i++)
+        {
+            ThreadLocations[i].resize(ConnectedBlocks.size());
+        }
         pthread_mutex_init(&GUIMutex, NULL);
         pthread_mutex_init(&IOMutex, NULL);
         pthread_mutex_init(&BestMutex, NULL);
@@ -55,9 +62,11 @@ namespace PARTITIONER
     void setNumberOfBlocks(uint32_t Num, bool Verbose)
     {
         ConnectedBlocks.resize(Num);
-        MaxPartitionSide = Num/2;
-        if (MaxPartitionSide*2 != Num)          // It was odd
-            MaxPartitionSide++;
+        // The maximum number of blocks per partition is exactly the half, or
+        // ceil the half if the number of blocks is odd.
+        MaxPartitionSize = Num/2;
+        if (MaxPartitionSize*2 != Num)          // Number of blocks was odd
+            MaxPartitionSize++;
         if (Verbose)
             std::cout << "\tEPartitioner: Initializing " << Num << " blocks\n";
     }
@@ -78,12 +87,14 @@ namespace PARTITIONER
             GUIThreadStartPoints.push_back(MainWindow->getOriginalStartPoint());
     }
 
+    // This is stupid, but GUIThreadStartPoints is passed through some functions
+    // and neads to be initialized even without a GUI.
     void detachGUI()
     {
         GUIThreadStartPoints.resize(NumThreads);
     }
 
-    // My multithreading works as follows: If visits ONLY the first depths of
+    // My multithreading works as follows: It visits ONLY the first depths of
     // the tree until it reaches a number of nodes equal to the number of
     // threads. Every thread the can go through the tree in the usual way.
     // EXAMPLE: if you use 4 threads, you need to visit two depth levels in
@@ -94,7 +105,9 @@ namespace PARTITIONER
         for (uint32_t i = 0; i < NumThreads; i++)
         {
             // This first element is always in the first partition
+            // NOTE: this is not shown in the GUI.
             std::get<0>(ThreadStartPoints[i]).push_back(0);
+            ThreadLocations[i][0] = 1;
 
             // Since It's not good to use recursion here, or maybe it is but
             // it's not really worth it. And since the number of threads is
@@ -108,10 +121,11 @@ namespace PARTITIONER
             uint32_t CopyI = i;
             for (uint32_t j = 0; j < std::log2(NumThreads); j++)
             {
-                // Now assign the start point of each thread
+                // Now assign the start point of each thread based on the bits
                 if(CopyI & 1)
                 {
                     std::get<1>(ThreadStartPoints[i]).push_back(j+1);
+                    ThreadLocations[i][j+1] = 2;
                     if (MainWindow)
                     {
                         GUIThreadStartPoints[i] = MainWindow->paintTreeBranch(GUIThreadStartPoints[i], j+1, true, Verbose);
@@ -121,6 +135,7 @@ namespace PARTITIONER
                 else
                 {
                     std::get<0>(ThreadStartPoints[i]).push_back(j+1);
+                    ThreadLocations[i][j+1] = 1;
                     if (MainWindow)
                     {
                         GUIThreadStartPoints[i] = MainWindow->paintTreeBranch(GUIThreadStartPoints[i], j+1, false, Verbose);
@@ -149,7 +164,7 @@ namespace PARTITIONER
 
     void startPartitioning(bool Verbose)
     {
-        // Start creating threads.
+        // Start creating worker threads.
         for (uint32_t i = 0; i < NumThreads; i++)
         {
             std::tuple<uint32_t, Partitions, Coordinates, uint32_t, bool> *Args;
@@ -162,6 +177,7 @@ namespace PARTITIONER
             pthread_join(WorkerThreads[i], NULL);
         }
 
+        // Print the result here
         std::cout << "EPartitioner: Best Solution is:\n";
         std::cout << "\tPartition1: ";
         for (uint32_t j = 0; j < std::get<0>(BestSolution).size(); j++)
@@ -177,6 +193,9 @@ namespace PARTITIONER
         std::cout << "EPartitioner: Best Solution Cost is: " << BestSolutionCost << "\n";
     }
 
+    // This should have been the same as the function below, but instead of
+    // converting the void args to parameters everytime it's called, I only
+    // use it as a one time interface when calling threads.
     void *recursivePartitioning(void *Args)
     {
         std::tuple<uint32_t, Partitions, Coordinates, uint32_t, bool> RealArgs;
@@ -190,14 +209,18 @@ namespace PARTITIONER
     // call, this might be huge, I don't want copies of this everytime a new
     // instance of this function is called.
     // A better solution would be to use only one of those, push to it with
-    // each new call, and pop from it upon each return
+    // each new call, and pop from it upon each return. This is the solution
+    // we use.
+    // TODO: but I'm not really going to do it. since I pass TID here, maybe
+    // I could do this without passing the CurrentSolution and the GUICurrentSolution.
     void recursivePartitioning(uint32_t TID, Partitions& CurrentSolution, Coordinates& GUICurrentSolution, uint32_t Level, bool Verbose)
     {
-        uint32_t Cost = calculateCost(CurrentSolution);
+        // Begin by calculating our cost, we will use it later.
+        uint32_t Cost = calculateCost(CurrentSolution, ThreadLocations[TID]);
 
-        // If we exceed the maximum number for each partition, do not continue
-        if (std::get<0>(CurrentSolution).size() > MaxPartitionSide ||
-            std::get<1>(CurrentSolution).size() > MaxPartitionSide)
+        // If we exceed the maximum size for each partition, do not continue
+        if (std::get<0>(CurrentSolution).size() > MaxPartitionSize ||
+            std::get<1>(CurrentSolution).size() > MaxPartitionSize)
         {
             if (Verbose)
             {
@@ -208,6 +231,10 @@ namespace PARTITIONER
             return;
         }
 
+        // If we reach a terminal node, exit.
+        // NOTE: this check has to happen after the size check, otherwise some
+        // unbalanced solutions that exist at leaves might be accepted.
+        // DO NOT MOVE.
         if(Level+1 == ConnectedBlocks.size())     // We have nothing more to partition
         {
             if (Verbose)
@@ -224,6 +251,7 @@ namespace PARTITIONER
             // potential benefit.
             if (Cost < BestSolutionCost)
             {
+                // Now update the best solution for the other guys
                 pthread_mutex_lock(&BestMutex);
                 if (Cost < BestSolutionCost)
                 {
@@ -238,11 +266,24 @@ namespace PARTITIONER
         // Also if the current cost is equal to the minimum cost we've seen, just
         // forget about this.
         if (Cost == BestSolutionCost)
+        {
+            if (Verbose)
+            {
+                pthread_mutex_lock(&IOMutex);
+                std::cout << "EPartitioner: Pruned tree at cost " << Cost << "\n";
+                pthread_mutex_unlock(&IOMutex);
+            }
             return;
+        }
 
+        // We need to copy this because unlike the CurrentSolution, stuff cannot
+        // be pushed and popped from here.
         Coordinates CopyGUICurrentSolution;
-        // Try pushing this to the right partition
+
+        // Try pushing this to the fisrt partition, and continue based on this.
+        // Also update the GUI.
         std::get<0>(CurrentSolution).push_back(Level+1);
+        ThreadLocations[TID][Level+1] = 1;
         if(Verbose)
         {
             pthread_mutex_lock(&IOMutex);
@@ -269,10 +310,12 @@ namespace PARTITIONER
             pthread_mutex_unlock(&GUIMutex);
         }
         recursivePartitioning(TID, CurrentSolution, GUICurrentSolution, Level+1, Verbose);
+        // Now pop whatever you pushed in, we need to try a brand new branch.
         std::get<0>(CurrentSolution).pop_back();
 
-        // Now try the left
+        // Now do the same for the second partition.
         std::get<1>(CurrentSolution).push_back(Level+1);
+        ThreadLocations[TID][Level+1] = 2;
         if(Verbose)
         {
             pthread_mutex_lock(&IOMutex);
@@ -299,9 +342,10 @@ namespace PARTITIONER
         }
         recursivePartitioning(TID, CurrentSolution, GUICurrentSolution, Level+1, Verbose);
         std::get<1>(CurrentSolution).pop_back();
+        ThreadLocations[TID][Level+1] = 0;
     }
 
-    uint32_t calculateCost(Partitions& Targets)
+    uint32_t calculateCost(Partitions& Targets, Locations& TargetLocations)
     {
         uint32_t Cost = 0;
         // We should count the number of connections between partitions.
@@ -312,8 +356,16 @@ namespace PARTITIONER
             for (uint32_t j = 0; j < ConnectedBlocks[std::get<0>(Targets)[i]].size(); j++)
             {
                 // If the connection crosses the partitions boundary, add it
-                if (std::find(std::get<1>(Targets).begin(), std::get<1>(Targets).end(),
-                    ConnectedBlocks[std::get<0>(Targets)[i]][j]) != std::get<1>(Targets).end())
+                // if (std::find(std::get<1>(Targets).begin(), std::get<1>(Targets).end(),
+                //     ConnectedBlocks[std::get<0>(Targets)[i]][j]) != std::get<1>(Targets).end())
+                // {
+                //     Cost++;
+                // }
+
+                // This is an alternative, it saves me the search commented above.
+                // This is why I have been using this data structure all along.
+                // It saved me a precious 0.4 seconds when running cm138a
+                if (TargetLocations[ConnectedBlocks[std::get<0>(Targets)[i]][j]] == 2)
                 {
                     Cost++;
                 }
